@@ -33,6 +33,8 @@ struct Ui {
     source: adw::ComboRow,
     clients: adw::PreferencesGroup,
     client_rows: Arc<Mutex<Vec<adw::ActionRow>>>,
+    start_button: Button,
+    stop_button: Button,
     log: TextView,
 }
 
@@ -177,6 +179,18 @@ fn handle_msg(msg: Msg, ui: &Ui) {
                 None => ui.session.set_subtitle("not running"),
             }
 
+            if info.running {
+                ui.start_button.set_label("Running");
+                ui.start_button.set_sensitive(false);
+                ui.start_button.remove_css_class("suggested-action");
+                ui.stop_button.set_sensitive(true);
+            } else {
+                ui.start_button.set_label("Start hotspot");
+                ui.start_button.set_sensitive(true);
+                ui.start_button.add_css_class("suggested-action");
+                ui.stop_button.set_sensitive(false);
+            }
+
             let previous_source = selected_string(&ui.source);
             let model = gtk4::StringList::new(&[] as &[&str]);
             let mut selected = 0u32;
@@ -318,6 +332,7 @@ fn build_ui(app: &adw::Application) {
     let start = Button::with_label("Start hotspot");
     start.add_css_class("suggested-action");
     let stop = Button::with_label("Stop hotspot");
+    stop.set_sensitive(false);
     actions.append(&start);
     actions.append(&stop);
     left.append(&actions);
@@ -378,6 +393,8 @@ fn build_ui(app: &adw::Application) {
         source: source.clone(),
         clients: client_group.clone(),
         client_rows: Arc::new(Mutex::new(Vec::new())),
+        start_button: start.clone(),
+        stop_button: stop.clone(),
         log: log_view.clone(),
     };
 

@@ -10,13 +10,15 @@ MIT, Meshack Bahati.
 Runs a station and a virtual AP on one Wi-Fi card. It reads the driver's
 interface combinations, marks the virtual interface unmanaged in NetworkManager,
 limits the station to 2.4 GHz because 5 GHz is `PASSIVE-SCAN` on this chip,
-disables 802.11v BTM during the session, then starts hostapd and dnsmasq and
-adds source NAT plus a policy route for `192.168.42.0/24`. The AP address is
-derived from the station MAC, and a watcher follows station channel changes.
-`stop` reverses all of it.
+disables 802.11v BTM, then starts hostapd with 802.11n and WMM, plus dnsmasq,
+source NAT, FORWARD ACCEPT rules and a policy route for `192.168.42.0/24`.
+The AP address is derived from the station MAC; a watcher follows station
+channel changes; and a record in `/var/lib/airfork` restores the Wi-Fi profile
+after a crash. `stop` reverses all of it.
 
-The GUI polls status and DHCP leases every two seconds; the CLI exposes the
-same operations.
+The GUI polls status and DHCP leases every two seconds, so a session started
+from the terminal also shows as running and switches the button to `Running`.
+The CLI exposes the same operations.
 
 ## Limits
 
