@@ -3,7 +3,7 @@
 //! it just drives iw/ip/hostapd/dnsmasq/iptables instead of reimplementing
 //! them. easier to debug that way, and easier to throw away.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -239,7 +239,9 @@ fn freq_flags(text: &str, freq: Option<u32>) -> (bool, bool) {
     };
     for line in text.lines() {
         let trimmed = line.trim();
-        if !trimmed.starts_with(&format!("* {freq} MHz")) && !trimmed.starts_with(&format!("* {freq}.0 MHz")) {
+        if !trimmed.starts_with(&format!("* {freq} MHz"))
+            && !trimmed.starts_with(&format!("* {freq}.0 MHz"))
+        {
             continue;
         }
         return (
@@ -579,8 +581,7 @@ fn route_clients(gateway: &str, interface: &str) -> Result<()> {
     run("ip", &args)?;
     // a reconnect can wipe the table while the session is being set up
     for _ in 0..4 {
-        let table = stdout("ip", &["route", "show", "table", ROUTE_TABLE])
-            .unwrap_or_default();
+        let table = stdout("ip", &["route", "show", "table", ROUTE_TABLE]).unwrap_or_default();
         if table.contains("default") {
             return Ok(());
         }
@@ -672,9 +673,17 @@ pub fn doctor() -> DoctorReport {
         }
     }
     if tool_available("nft") {
-        report.add("ok", "nftables installed", "used for private firewall tables");
+        report.add(
+            "ok",
+            "nftables installed",
+            "used for private firewall tables",
+        );
     } else if tool_available("iptables") {
-        report.add("warn", "nftables missing, using iptables", "tagged rules only");
+        report.add(
+            "warn",
+            "nftables missing, using iptables",
+            "tagged rules only",
+        );
     } else {
         report.add("fail", "no firewall tool", "install nftables or iptables");
         missing.push("nftables or iptables");
@@ -684,34 +693,71 @@ pub fn doctor() -> DoctorReport {
         Ok(cap) => {
             report.add(
                 "info",
-                format!("adapter {} ({}, {})", cap.uplink, cap.phy, if cap.concurrent { "concurrent" } else { "single role" }),
+                format!(
+                    "adapter {} ({}, {})",
+                    cap.uplink,
+                    cap.phy,
+                    if cap.concurrent {
+                        "concurrent"
+                    } else {
+                        "single role"
+                    }
+                ),
                 cap.uplink_ssid.clone().unwrap_or_default(),
             );
             if cap.no_ir || cap.radar {
                 report.add(
                     "warn",
                     format!("channel {} is not usable for AP", cap.channel.unwrap_or(0)),
-                    if cap.radar { "DFS channel; use 2.4 GHz or 36-48/149-165" } else { "no IR; connect on 2.4 GHz or use a different country" },
+                    if cap.radar {
+                        "DFS channel; use 2.4 GHz or 36-48/149-165"
+                    } else {
+                        "no IR; connect on 2.4 GHz or use a different country"
+                    },
                 );
             }
             if cap.country.is_none() {
-                report.add("warn", "no regulatory country set", "5 GHz AP may fail; set your country with iw reg set");
+                report.add(
+                    "warn",
+                    "no regulatory country set",
+                    "5 GHz AP may fail; set your country with iw reg set",
+                );
             }
             if cap.ap_mode && cap.concurrent {
                 report.mode = "concurrent".into();
-                report.add("ok", "client and hotspot at once", if cap.same_channel_required { "AP will follow the station channel" } else { "different channels allowed" });
+                report.add(
+                    "ok",
+                    "client and hotspot at once",
+                    if cap.same_channel_required {
+                        "AP will follow the station channel"
+                    } else {
+                        "different channels allowed"
+                    },
+                );
             } else if let Some(second) = &cap.second_adapter {
                 report.mode = "dedicated".into();
-                report.add("ok", format!("second adapter {second} can host the hotspot"), "keep the uplink on the other interface");
+                report.add(
+                    "ok",
+                    format!("second adapter {second} can host the hotspot"),
+                    "keep the uplink on the other interface",
+                );
             } else if sources().iter().any(|source| source != &cap.uplink) {
                 report.mode = "dedicated".into();
-                report.add("ok", "a non-Wi-Fi uplink can feed a Wi-Fi-only hotspot", "use --uplink with the Wi-Fi chip as AP");
+                report.add(
+                    "ok",
+                    "a non-Wi-Fi uplink can feed a Wi-Fi-only hotspot",
+                    "use --uplink with the Wi-Fi chip as AP",
+                );
             } else {
                 report.verdict = "NOT READY: this chip cannot client and hotspot at once, and there is no second adapter or cable".into();
                 return report;
             }
             if !missing.is_empty() {
-                report.verdict = format!("ALMOST: {} mode once {} is installed", report.mode, missing.join(", "));
+                report.verdict = format!(
+                    "ALMOST: {} mode once {} is installed",
+                    report.mode,
+                    missing.join(", ")
+                );
             } else {
                 report.ready = true;
                 report.verdict = format!("READY: {} mode on {}", report.mode, cap.uplink);
@@ -724,8 +770,7 @@ pub fn doctor() -> DoctorReport {
 
 /// Interfaces that currently have an IPv4 default route, offered as internet sources.
 pub fn sources() -> Vec<String> {
-    let routes = stdout("ip", &["-4", "route", "show", "default"])
-        .unwrap_or_default();
+    let routes = stdout("ip", &["-4", "route", "show", "default"]).unwrap_or_default();
     let mut found = Vec::new();
     for line in routes.lines() {
         let words: Vec<&str> = line.split_whitespace().collect();
@@ -833,22 +878,43 @@ fn wait_for_uplink(interface: &str) {
     }
 }
 
-fn ensure_ap_band(capability: &Capability) -> Result<(Capability, Option<(String, Option<String>)>)> {
+fn ensure_ap_band(
+    capability: &Capability,
+) -> Result<(Capability, Option<(String, Option<String>)>)> {
     if capability.band != Some(Band::B5) && capability.band != Some(Band::B6) {
         return Ok((capability.clone(), None));
     }
-    let name = stdout("nmcli", &["-g", "GENERAL.CONNECTION", "dev", "show", &capability.uplink])?
-        .trim()
-        .to_string();
+    let name = stdout(
+        "nmcli",
+        &[
+            "-g",
+            "GENERAL.CONNECTION",
+            "dev",
+            "show",
+            &capability.uplink,
+        ],
+    )?
+    .trim()
+    .to_string();
     if name.is_empty() {
         bail!("the uplink is not managed by NetworkManager, so it cannot be limited automatically");
     }
-    let previous = stdout("nmcli", &["-g", "802-11-wireless.band", "con", "show", &name])?
-        .trim()
-        .to_string();
-    let previous = if previous.is_empty() { None } else { Some(previous) };
+    let previous = stdout(
+        "nmcli",
+        &["-g", "802-11-wireless.band", "con", "show", &name],
+    )?
+    .trim()
+    .to_string();
+    let previous = if previous.is_empty() {
+        None
+    } else {
+        Some(previous)
+    };
 
-    run("nmcli", &["con", "mod", &name, "802-11-wireless.band", "bg"])?;
+    run(
+        "nmcli",
+        &["con", "mod", &name, "802-11-wireless.band", "bg"],
+    )?;
     save_band_restore(&name, &previous)?;
     let _ = run("nmcli", &["con", "up", &name]);
     wait_for_uplink(&capability.uplink);
@@ -947,8 +1013,18 @@ fn firewall_up(ap: &str) -> Result<String> {
         return Ok("nft".into());
     }
     let nat_args = [
-        "-t", "nat", "-A", "POSTROUTING", "-s", CLIENT_SUBNET, "-j", "MASQUERADE",
-        "-m", "comment", "--comment", NAT_COMMENT,
+        "-t",
+        "nat",
+        "-A",
+        "POSTROUTING",
+        "-s",
+        CLIENT_SUBNET,
+        "-j",
+        "MASQUERADE",
+        "-m",
+        "comment",
+        "--comment",
+        NAT_COMMENT,
     ];
     run("iptables", &nat_args)?;
     allow_forwarding()?;
@@ -962,8 +1038,18 @@ fn firewall_down(method: &str, ap: &str) {
         return;
     }
     let nat_args = [
-        "-t", "nat", "-D", "POSTROUTING", "-s", CLIENT_SUBNET, "-j", "MASQUERADE",
-        "-m", "comment", "--comment", NAT_COMMENT,
+        "-t",
+        "nat",
+        "-D",
+        "POSTROUTING",
+        "-s",
+        CLIENT_SUBNET,
+        "-j",
+        "MASQUERADE",
+        "-m",
+        "comment",
+        "--comment",
+        NAT_COMMENT,
     ];
     let _ = run("iptables", &nat_args);
     remove_forwarding();
@@ -975,11 +1061,30 @@ fn firewall_down(method: &str, ap: &str) {
 fn forward_rules() -> [Vec<&'static str>; 2] {
     [
         vec![
-            "FORWARD", "-s", CLIENT_SUBNET, "-j", "ACCEPT", "-m", "comment", "--comment", NAT_COMMENT,
+            "FORWARD",
+            "-s",
+            CLIENT_SUBNET,
+            "-j",
+            "ACCEPT",
+            "-m",
+            "comment",
+            "--comment",
+            NAT_COMMENT,
         ],
         vec![
-            "FORWARD", "-d", CLIENT_SUBNET, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED",
-            "-j", "ACCEPT", "-m", "comment", "--comment", NAT_COMMENT,
+            "FORWARD",
+            "-d",
+            CLIENT_SUBNET,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
+            "-m",
+            "comment",
+            "--comment",
+            NAT_COMMENT,
         ],
     ]
 }
@@ -1056,9 +1161,7 @@ fn ap_mac_for(uplink: &str) -> Option<String> {
 fn hide_from_networkmanager(ap: &str, mac: &str) -> Result<()> {
     fs::write(
         NM_CONF,
-        format!(
-            "[keyfile]\nunmanaged-devices=interface-name:{ap};mac:{mac}\n"
-        ),
+        format!("[keyfile]\nunmanaged-devices=interface-name:{ap};mac:{mac}\n"),
     )?;
     run("nmcli", &["general", "reload"])
 }
@@ -1091,7 +1194,14 @@ fn wait_for_hostapd(ap: &str) -> Result<u32> {
         .take(5)
         .collect::<Vec<_>>()
         .join("\n");
-    bail!("hostapd did not bring up {ap}{}", if detail.is_empty() { String::new() } else { format!(":\n{detail}") })
+    bail!(
+        "hostapd did not bring up {ap}{}",
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(":\n{detail}")
+        }
+    )
 }
 
 pub fn plan(config: &HotspotConfig) -> Result<String> {
@@ -1124,7 +1234,12 @@ pub fn plan(config: &HotspotConfig) -> Result<String> {
         (channel, Band::B2_4, ap_channel, note)
     } else {
         let channel = config.channel.unwrap_or(6);
-        (channel, Band::B2_4, channel.to_string(), "Mode        dedicated AP\n".to_string())
+        (
+            channel,
+            Band::B2_4,
+            channel.to_string(),
+            "Mode        dedicated AP\n".to_string(),
+        )
     };
     let source = config.uplink.as_deref().unwrap_or(&capability.uplink);
     Ok(format!(
@@ -1176,7 +1291,10 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
         if uplink_gateway(&capability.uplink).is_ok() {
             capability.uplink.clone()
         } else {
-            sources().into_iter().next().unwrap_or_else(|| capability.uplink.clone())
+            sources()
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| capability.uplink.clone())
         }
     });
     let ap_base = config
@@ -1190,8 +1308,9 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
             capability.combinations.join("\n")
         );
     }
-    let source_gateway = uplink_gateway(&net_source)
-        .with_context(|| format!("{net_source} has no default route; pick another internet source"))?;
+    let source_gateway = uplink_gateway(&net_source).with_context(|| {
+        format!("{net_source} has no default route; pick another internet source")
+    })?;
 
     let (mut capability, pin, btm_before) = if concurrent {
         // ignore band steering before the station changes channel
@@ -1278,7 +1397,10 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
                 .trim()
                 .to_string()
         };
-        let _ = run("nmcli", &["dev", "set", &config.ap_interface, "managed", "no"]);
+        let _ = run(
+            "nmcli",
+            &["dev", "set", &config.ap_interface, "managed", "no"],
+        );
 
         let _ = fs::remove_file(HOSTAPD_PID);
         let _ = fs::remove_file(HOSTAPD_LOG);
@@ -1310,7 +1432,11 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
             net_source: net_source.clone(),
             ap_interface: config.ap_interface.clone(),
             ap_base: ap_base.clone(),
-            mode: if concurrent { "concurrent".into() } else { "dedicated".into() },
+            mode: if concurrent {
+                "concurrent".into()
+            } else {
+                "dedicated".into()
+            },
             ap_mac: ap_mac.clone(),
             channel,
             band: band.label().to_string(),
@@ -1374,10 +1500,7 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
                 let _ = restore_band(name, &band_before);
             }
             clear_band_restore();
-            set_btm(
-                &capability.uplink,
-                btm_before.as_deref().unwrap_or("0"),
-            );
+            set_btm(&capability.uplink, btm_before.as_deref().unwrap_or("0"));
             Err(error)
         }
     }
@@ -1437,10 +1560,7 @@ pub fn stop() -> Result<()> {
         let _ = restore_band(name, &state.band_before);
     }
     clear_band_restore();
-    set_btm(
-        &state.uplink,
-        state.btm_before.as_deref().unwrap_or("0"),
-    );
+    set_btm(&state.uplink, state.btm_before.as_deref().unwrap_or("0"));
     let _ = fs::remove_file(STATE_FILE);
     Ok(())
 }
@@ -1469,7 +1589,11 @@ fn current_channel(interface: &str) -> Option<(u32, u8)> {
 
 fn watch_log(line: &str) {
     use std::io::Write;
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(WATCH_LOG) {
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(WATCH_LOG)
+    {
         let _ = writeln!(file, "{line}");
     }
 }
@@ -1675,7 +1799,11 @@ mod tests {
         let rules = forward_rules();
         assert!(rules[0].contains(&"-s") && rules[0].contains(&CLIENT_SUBNET));
         assert!(rules[1].contains(&"-d") && rules[1].contains(&"RELATED,ESTABLISHED"));
-        assert!(rules.iter().all(|rule| rule[0] == "FORWARD" && rule.contains(&NAT_COMMENT)));
+        assert!(
+            rules
+                .iter()
+                .all(|rule| rule[0] == "FORWARD" && rule.contains(&NAT_COMMENT))
+        );
     }
 
     #[test]
@@ -1693,7 +1821,10 @@ mod tests {
         assert_eq!(first & 0x01, 0);
         assert_eq!(first & 0x02, 0x02);
         assert_ne!(ap, station);
-        assert_eq!(derive_mac("02:00:00:00:01:01").unwrap(), "02:00:00:00:5b:01");
+        assert_eq!(
+            derive_mac("02:00:00:00:01:01").unwrap(),
+            "02:00:00:00:5b:01"
+        );
         assert!(derive_mac("bad").is_none());
     }
 

@@ -1,17 +1,17 @@
 //! gtk window. read-only calls go straight to the library, privileged ones
 //! go through pkexec on the cli binary so the ui itself stays unprivileged.
 
+use adw::prelude::*;
 use anyhow::{Context, Result};
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{Box, Button, Label, Orientation, ScrolledWindow, TextView, WrapMode};
 use libadwaita as adw;
-use adw::prelude::*;
 
+use airfork::{HotspotConfig, StatusInfo, clients, sources, status};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use airfork::{clients, sources, status, HotspotConfig, StatusInfo};
 
 enum Msg {
     Refresh(StatusInfo),
@@ -48,7 +48,9 @@ fn main() {
 
 // adw row titles go through pango markup, and capability strings contain "<="
 fn escaped(text: &str) -> String {
-    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn selected_string(combo: &adw::ComboRow) -> Option<String> {
@@ -110,11 +112,19 @@ fn update_clients(ui: &Ui, list: Vec<airfork::ClientInfo>) {
         rows.push(row);
     }
     for client in list {
-        let title = client.hostname.as_deref().unwrap_or(&client.mac).to_string();
+        let title = client
+            .hostname
+            .as_deref()
+            .unwrap_or(&client.mac)
+            .to_string();
         let subtitle = format!(
             "{} · {}",
             client.ip.as_deref().unwrap_or("no address"),
-            if client.connected { "connected" } else { "leased" }
+            if client.connected {
+                "connected"
+            } else {
+                "leased"
+            }
         );
         let row = adw::ActionRow::builder()
             .title(escaped(&title))
@@ -143,8 +153,16 @@ fn handle_msg(msg: Msg, ui: &Ui) {
                 }
                 ui.mode.set_subtitle(&escaped(&format!(
                     "{} · same channel {}",
-                    if cap.concurrent { "supported" } else { "unsupported" },
-                    if cap.same_channel_required { "required" } else { "optional" }
+                    if cap.concurrent {
+                        "supported"
+                    } else {
+                        "unsupported"
+                    },
+                    if cap.same_channel_required {
+                        "required"
+                    } else {
+                        "optional"
+                    }
                 )));
 
                 {
@@ -154,7 +172,9 @@ fn handle_msg(msg: Msg, ui: &Ui) {
                     }
                     added.clear();
                     for combination in &cap.combinations {
-                        let row = adw::ActionRow::builder().title(escaped(combination)).build();
+                        let row = adw::ActionRow::builder()
+                            .title(escaped(combination))
+                            .build();
                         ui.combos.add_row(&row);
                         added.push(row);
                     }
@@ -245,7 +265,10 @@ fn build_ui(app: &adw::Application) {
         .title("Uplink")
         .subtitle("checking...")
         .build();
-    let channel = adw::ActionRow::builder().title("Channel").subtitle("—").build();
+    let channel = adw::ActionRow::builder()
+        .title("Channel")
+        .subtitle("—")
+        .build();
     let mode = adw::ActionRow::builder()
         .title("Concurrent AP + station")
         .subtitle("—")
@@ -290,7 +313,9 @@ fn build_ui(app: &adw::Application) {
         .title("Internet source")
         .description("which interface carries the hotspot traffic")
         .build();
-    let source = adw::ComboRow::builder().title("Share connection from").build();
+    let source = adw::ComboRow::builder()
+        .title("Share connection from")
+        .build();
     source_group.add(&source);
     page.add(&source_group);
 

@@ -7,12 +7,13 @@ MIT, Meshack Bahati.
 
 ## Function
 
-Runs a station and a virtual AP on one Wi-Fi card. It reads the driver's
+Runs a station and a virtual AP on one Wi-Fi card, or uses a second adapter
+or a cable as the uplink. It reads the driver's
 interface combinations, marks the virtual interface unmanaged in NetworkManager,
 limits the station to 2.4 GHz because 5 GHz is `PASSIVE-SCAN` on this chip,
 disables 802.11v BTM, then starts hostapd with 802.11n and WMM, plus dnsmasq,
-source NAT, FORWARD ACCEPT rules and a policy route for `192.168.42.0/24`.
-The AP address is derived from the station MAC; a watcher follows station
+source NAT through private nftables tables (iptables fallback) and a policy
+route for `192.168.42.0/24`. The AP address is derived from the station MAC; a watcher follows station
 channel changes; and a record in `/var/lib/airfork` restores the Wi-Fi profile
 after a crash. `stop` reverses all of it.
 
@@ -45,16 +46,22 @@ cargo build --release
 ## Use
 
 ```sh
-airfork detect
-airfork sources
+airfork doctor                  # is this machine ready, and in which mode?
+airfork detect                  # adapter details
+airfork sources                 # interfaces with a default route
 airfork plan --uplink wlan0
+airfork start --dry-run --uplink wlan0
 sudo airfork start --ssid LabHotspot --password airfork-2026 --uplink wlan0
-airfork status
+# dedicated: sudo airfork start --uplink enp3s0 --channel 6
 sudo airfork stop
 ```
 
-GUI defaults: `LabHotspot` / `airfork-2026`. Pick the internet source before
-starting.
+Other flags: `--ap-base IFACE`, `--hidden`, `--channel N`. GUI defaults:
+`LabHotspot` / `airfork-2026`. Pick the internet source before starting.
+
+GitHub Actions runs format, check, clippy, tests and a release build on every
+push and pull request. Tagging `v*` publishes a tarball with both binaries,
+the GUI launcher, dispatcher hook and docs.
 
 ## Layout
 

@@ -1,8 +1,8 @@
 //! cli frontend. nothing clever here.
 
+use airfork::{Capability, HotspotConfig, StatusInfo, detect, plan, start, status, stop};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use airfork::{detect, plan, start, status, stop, Capability, HotspotConfig, StatusInfo};
 
 // piping to head should not make the tool panic
 macro_rules! out {
@@ -130,14 +130,13 @@ fn print_capability(capability: &Capability) {
     if let Some(ssid) = &capability.uplink_ssid {
         out!("Network      {ssid}");
     }
-    match (capability.frequency_mhz, capability.channel, capability.band) {
+    match (
+        capability.frequency_mhz,
+        capability.channel,
+        capability.band,
+    ) {
         (Some(freq), Some(channel), Some(band)) => {
-            out!(
-                "Channel      {} ({} MHz, {})",
-                channel,
-                freq,
-                band.label()
-            );
+            out!("Channel      {} ({} MHz, {})", channel, freq, band.label());
         }
         _ => out!("Channel      none; the station is not connected"),
     }
@@ -205,10 +204,16 @@ fn print_status(info: &StatusInfo) {
             out!("Virtual AP   {}", state.ap_interface);
             out!(
                 "Uplink       {} on {} channel {}",
-                state.uplink, state.band, state.channel
+                state.uplink,
+                state.band,
+                state.channel
             );
             out!("Gateway      {}", state.gateway);
-            out!("Daemons      hostapd {}, dnsmasq {}", state.hostapd_pid, state.dnsmasq_pid);
+            out!(
+                "Daemons      hostapd {}, dnsmasq {}",
+                state.hostapd_pid,
+                state.dnsmasq_pid
+            );
         }
         None => out!("Session      not running"),
     }
@@ -263,7 +268,14 @@ fn main() -> Result<()> {
             hidden,
         } => {
             let config = config_from(
-                ssid, password, ap_interface, country, uplink, ap_base, channel, hidden,
+                ssid,
+                password,
+                ap_interface,
+                country,
+                uplink,
+                ap_base,
+                channel,
+                hidden,
             );
             out!("{}", plan(&config)?);
         }
@@ -279,7 +291,14 @@ fn main() -> Result<()> {
             dry_run,
         } => {
             let config = config_from(
-                ssid, password, ap_interface, country, uplink, ap_base, channel, hidden,
+                ssid,
+                password,
+                ap_interface,
+                country,
+                uplink,
+                ap_base,
+                channel,
+                hidden,
             );
             if dry_run {
                 out!("Dry run — no changes made");
@@ -287,11 +306,18 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             let state = start(&config)?;
-            out!("Hotspot \"{}\" is running on {}", state.ssid, state.ap_interface);
+            out!(
+                "Hotspot \"{}\" is running on {}",
+                state.ssid,
+                state.ap_interface
+            );
             if let Some(notice) = &state.notice {
                 out!("Note         {notice}");
             }
-            out!("Clients receive an address on {} and reach the uplink through NAT.", state.gateway);
+            out!(
+                "Clients receive an address on {} and reach the uplink through NAT.",
+                state.gateway
+            );
             out!("Stop it with: airfork stop");
         }
         Command::Watch => {
