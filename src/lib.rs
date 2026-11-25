@@ -498,6 +498,8 @@ pub struct RuntimeState {
     pub band_before: Option<String>,
     pub btm_before: Option<String>,
     pub uplink_gateway: String,
+    #[serde(default)]
+    pub firewall: String,
     pub notice: Option<String>,
 }
 
@@ -911,6 +913,63 @@ fn recover_leftovers() {
     }
 }
 
+fn run_stdin(program: &str, args: &[&str], input: &str) -> Result<()> {
+    use std::io::Write;
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("could not execute {program}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(input.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        bail!("{program} {} failed", args.join(" "));
+    }
+    Ok(())
+}
+
+// private nftables tables are safer than touching the user's iptables chains
+fn nft_rules(ap: &str) -> String {
+    format!(
+        "table ip airfork_nat {{\n  chain post {{\n    type nat hook postrouting priority 100;\n    ip saddr {CLIENT_SUBNET} oifname != \"{ap}\" masquerade\n  }}\n}}\n\
+         table inet airfork_fw {{\n  chain input {{\n    type filter hook input priority -10;\n    iifname \"{ap}\" udp dport {{ 53, 67 }} accept\n    iifname \"{ap}\" tcp dport 53 accept\n  }}\n\
+           chain forward {{\n    type filter hook forward priority -10;\n    iifname \"{ap}\" accept\n    oifname \"{ap}\" ct state established,related accept\n  }}\n}}\n"
+    )
+}
+
+fn firewall_up(ap: &str) -> Result<String> {
+    if tool_available("nft") {
+        let _ = run("nft", &["delete", "table", "ip", "airfork_nat"]);
+        let _ = run("nft", &["delete", "table", "inet", "airfork_fw"]);
+        run_stdin("nft", &["-f", "-"], &nft_rules(ap))?;
+        return Ok("nft".into());
+    }
+    let nat_args = [
+        "-t", "nat", "-A", "POSTROUTING", "-s", CLIENT_SUBNET, "-j", "MASQUERADE",
+        "-m", "comment", "--comment", NAT_COMMENT,
+    ];
+    run("iptables", &nat_args)?;
+    allow_forwarding()?;
+    Ok("iptables".into())
+}
+
+fn firewall_down(method: &str, ap: &str) {
+    if method == "nft" {
+        let _ = run("nft", &["delete", "table", "ip", "airfork_nat"]);
+        let _ = run("nft", &["delete", "table", "inet", "airfork_fw"]);
+        return;
+    }
+    let nat_args = [
+        "-t", "nat", "-D", "POSTROUTING", "-s", CLIENT_SUBNET, "-j", "MASQUERADE",
+        "-m", "comment", "--comment", NAT_COMMENT,
+    ];
+    let _ = run("iptables", &nat_args);
+    remove_forwarding();
+    let _ = ap;
+}
+
 // MASQUERADE alone is not enough when something (Docker, ufw, firewalld) has
 // set the FORWARD policy to DROP: clients join but get no internet.
 fn forward_rules() -> [Vec<&'static str>; 2] {
@@ -1242,34 +1301,7 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
         run("dnsmasq", &["-C", DNSMASQ_CONF])?;
         let dnsmasq_pid = read_pid(DNSMASQ_PID)?;
 
-        // source-based NAT, so it works even when another interface owns the
-        // default route or the policy route gets rewritten later
-        let nat_args = [
-            "-t",
-            "nat",
-            "-C",
-            "POSTROUTING",
-            "-s",
-            CLIENT_SUBNET,
-            "-j",
-            "MASQUERADE",
-            "-m",
-            "comment",
-            "--comment",
-            NAT_COMMENT,
-        ];
-        let already_natted = Command::new("iptables")
-            .args(nat_args)
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false);
-        if !already_natted {
-            let mut add_args = nat_args.to_vec();
-            add_args[2] = "-A";
-            run("iptables", &add_args)?;
-        }
-
-        allow_forwarding()?;
+        let firewall = firewall_up(&config.ap_interface)?;
         route_clients(&source_gateway, &net_source)?;
         fs::write("/proc/sys/net/ipv4/ip_forward", "1\n")?;
 
@@ -1292,6 +1324,7 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
             band_before: band_before.clone(),
             btm_before: btm_before.clone(),
             uplink_gateway: source_gateway.clone(),
+            firewall: firewall.clone(),
             notice: notice.clone(),
         })
     })();
@@ -1328,6 +1361,8 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
                 ],
             );
             remove_forwarding();
+            let _ = run("nft", &["delete", "table", "ip", "airfork_nat"]);
+            let _ = run("nft", &["delete", "table", "inet", "airfork_fw"]);
             unroute_clients(&source_gateway, &net_source);
             let _ = fs::write(
                 "/proc/sys/net/ipv4/ip_forward",
@@ -1372,23 +1407,7 @@ pub fn stop() -> Result<()> {
     if process_is(state.dnsmasq_pid, "dnsmasq") {
         let _ = run("kill", &[&state.dnsmasq_pid.to_string()]);
     }
-    let _ = run(
-        "iptables",
-        &[
-            "-t",
-            "nat",
-            "-D",
-            "POSTROUTING",
-            "-s",
-            CLIENT_SUBNET,
-            "-j",
-            "MASQUERADE",
-            "-m",
-            "comment",
-            "--comment",
-            NAT_COMMENT,
-        ],
-    );
+    firewall_down(&state.firewall, &state.ap_interface);
     // older sessions used an interface-scoped rule with the same comment
     let _ = run(
         "iptables",
@@ -1407,7 +1426,6 @@ pub fn stop() -> Result<()> {
             NAT_COMMENT,
         ],
     );
-    remove_forwarding();
     unroute_clients(&state.uplink_gateway, &state.net_source);
     let _ = fs::write(
         "/proc/sys/net/ipv4/ip_forward",
