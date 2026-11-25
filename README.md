@@ -1,7 +1,7 @@
 # airfork
 
 Experimental. Tested on **Intel Wireless-AC 9260** with `iwlwifi`.
-MIT, Meshack Bahati.
+MIT licensed.
 
 ![airfork GUI](screenshots/gui-cropped.png)
 
@@ -73,4 +73,4 @@ src/gui.rs   GTK frontend
 
 ## License
 
-MIT. Copyright (c) 2026 Meshack Bahati. See `LICENSE`.
+MIT. Copyright (c) 2026 the airfork contributors. See `LICENSE`.
