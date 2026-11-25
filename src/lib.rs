@@ -607,6 +607,13 @@ fn process_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+// a saved PID can be recycled by an unrelated process, so check the command
+fn process_is(pid: u32, name: &str) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/cmdline"))
+        .map(|command| command.contains(name))
+        .unwrap_or(false)
+}
+
 // band limit, not BSSID pin. a pin stops the card from recovering when the
 // router kicks it off with a BSS transition request.
 // nmcli blocks on full activation by default, which can take a minute. cap
@@ -1116,14 +1123,14 @@ pub fn stop() -> Result<()> {
     let state: RuntimeState = serde_json::from_str(&contents).context("invalid session state")?;
 
     if let Some(pid) = state.watch_pid {
-        if process_alive(pid) {
+        if process_is(pid, "airfork") {
             let _ = run("kill", &[&pid.to_string()]);
         }
     }
-    if process_alive(state.hostapd_pid) {
+    if process_is(state.hostapd_pid, "hostapd") {
         let _ = run("kill", &[&state.hostapd_pid.to_string()]);
     }
-    if process_alive(state.dnsmasq_pid) {
+    if process_is(state.dnsmasq_pid, "dnsmasq") {
         let _ = run("kill", &[&state.dnsmasq_pid.to_string()]);
     }
     let _ = run(
@@ -1181,8 +1188,7 @@ pub fn stop() -> Result<()> {
     Ok(())
 }
 
-fn current_channel(interface: &str) -> Option<(u32, u8)> {
-    let info = stdout("iw", &["dev", interface, "info"]).ok()?;
+fn parse_channel_info(info: &str) -> Option<(u32, u8)> {
     for line in info.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("channel ") {
@@ -1198,6 +1204,10 @@ fn current_channel(interface: &str) -> Option<(u32, u8)> {
         }
     }
     None
+}
+
+fn current_channel(interface: &str) -> Option<(u32, u8)> {
+    parse_channel_info(&stdout("iw", &["dev", interface, "info"]).ok()?)
 }
 
 fn watch_log(line: &str) {
@@ -1414,6 +1424,13 @@ mod tests {
         assert!(rules[0].contains(&"-s") && rules[0].contains(&CLIENT_SUBNET));
         assert!(rules[1].contains(&"-d") && rules[1].contains(&"RELATED,ESTABLISHED"));
         assert!(rules.iter().all(|rule| rule[0] == "FORWARD" && rule.contains(&NAT_COMMENT)));
+    }
+
+    #[test]
+    fn channel_info_parser() {
+        let info = "Interface wlan0\n\ttype managed\n\tchannel 6 (2437 MHz), width: 20 MHz\n";
+        assert_eq!(parse_channel_info(info), Some((2437, 6)));
+        assert_eq!(parse_channel_info("no channel here"), None);
     }
 
     #[test]
