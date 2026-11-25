@@ -60,6 +60,8 @@ enum Command {
     Sources,
     /// Stop the virtual access point and remove its resources; requires root
     Stop,
+    #[command(hide = true)]
+    Watch,
     /// Report the active session and the adapter state
     Status {
         #[arg(long)]
@@ -205,6 +207,9 @@ fn main() -> Result<()> {
             }
             out!("Clients receive an address on {} and reach the uplink through NAT.", state.gateway);
             out!("Stop it with: airfork stop");
+        }
+        Command::Watch => {
+            airfork::watch()?;
         }
         Command::Sources => {
             for source in airfork::sources() {

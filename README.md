@@ -11,8 +11,9 @@ Runs a station and a virtual AP on one Wi-Fi card. It reads the driver's
 interface combinations, marks the virtual interface unmanaged in NetworkManager,
 limits the station to 2.4 GHz because 5 GHz is `PASSIVE-SCAN` on this chip,
 disables 802.11v BTM during the session, then starts hostapd and dnsmasq and
-adds source NAT plus a policy route for `192.168.42.0/24`. `stop` reverses all
-of it.
+adds source NAT plus a policy route for `192.168.42.0/24`. The AP address is
+derived from the station MAC, and a watcher follows station channel changes.
+`stop` reverses all of it.
 
 The GUI polls status and DHCP leases every two seconds; the CLI exposes the
 same operations.

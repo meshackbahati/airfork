@@ -22,6 +22,7 @@ pub const NM_CONF: &str = "/etc/NetworkManager/conf.d/99-airfork.conf";
 pub const DHCP_LEASES: &str = "/run/airfork/dnsmasq.leases";
 pub const CLIENT_SUBNET: &str = "192.168.42.0/24";
 pub const ROUTE_TABLE: &str = "42";
+pub const WATCH_LOG: &str = "/run/airfork/watch.log";
 
 // locally administered, so it never collides with the station MAC
 pub const AP_MAC: &str = "02:00:00:00:01:01";
@@ -382,12 +383,14 @@ pub struct RuntimeState {
     pub uplink: String,
     pub net_source: String,
     pub ap_interface: String,
+    pub ap_mac: String,
     pub channel: u8,
     pub band: String,
     pub ssid: String,
     pub gateway: String,
     pub hostapd_pid: u32,
     pub dnsmasq_pid: u32,
+    pub watch_pid: Option<u32>,
     pub ip_forward_before: String,
     pub pinned_connection: Option<String>,
     pub band_before: Option<String>,
@@ -756,14 +759,41 @@ fn read_btm(interface: &str) -> Option<String> {
         .map(|value| value.trim().to_string())
 }
 
+// the station MAC is already locally administered on many machines, so the
+// XOR is what guarantees the AP address stays distinct from it
+fn derive_mac(station: &str) -> Option<String> {
+    let mut bytes: Vec<u8> = station
+        .trim()
+        .split(':')
+        .map(|part| u8::from_str_radix(part, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    if bytes.len() != 6 {
+        return None;
+    }
+    bytes[0] = (bytes[0] | 0x02) & 0xfe;
+    bytes[4] ^= 0x5a;
+    Some(
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
+}
+
+fn ap_mac_for(uplink: &str) -> Option<String> {
+    let text = fs::read_to_string(format!("/sys/class/net/{uplink}/address")).ok()?;
+    derive_mac(&text)
+}
+
 // NM has to be told to leave the virtual interface alone before it appears.
 // Setting it unmanaged after creation is too late: NM and wpa_supplicant
 // already grabbed it and hostapd then cannot bring it up.
-fn hide_from_networkmanager(ap: &str) -> Result<()> {
+fn hide_from_networkmanager(ap: &str, mac: &str) -> Result<()> {
     fs::write(
         NM_CONF,
         format!(
-            "[keyfile]\nunmanaged-devices=interface-name:{ap};mac:{AP_MAC}\n"
+            "[keyfile]\nunmanaged-devices=interface-name:{ap};mac:{mac}\n"
         ),
     )?;
     run("nmcli", &["general", "reload"])
@@ -833,7 +863,7 @@ pub fn plan(config: &HotspotConfig) -> Result<String> {
         capability.frequency_mhz.unwrap_or(0),
         band.label(),
         config.ap_interface,
-        AP_MAC,
+        ap_mac_for(&capability.uplink).unwrap_or_else(|| AP_MAC.to_string()),
         config.ssid,
         ap_band.label(),
         ap_channel,
@@ -908,8 +938,10 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
         .trim()
         .to_string();
 
+    let ap_mac = ap_mac_for(&capability.uplink).unwrap_or_else(|| AP_MAC.to_string());
+
     // NM must be out of the way before the interface exists
-    hide_from_networkmanager(&config.ap_interface)?;
+    hide_from_networkmanager(&config.ap_interface, &ap_mac)?;
 
     // a failed previous run can leave the interface behind
     let _ = run("iw", &["dev", &config.ap_interface, "del"]);
@@ -929,10 +961,20 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
 
     // anything after the interface creation can fail, so undo on the way out
     let result = (|| -> Result<RuntimeState> {
-        run(
+        // some chips refuse the address; keep the one the kernel assigned
+        let ap_mac = if run(
             "ip",
-            &["link", "set", &config.ap_interface, "address", AP_MAC],
-        )?;
+            &["link", "set", &config.ap_interface, "address", &ap_mac],
+        )
+        .is_ok()
+        {
+            ap_mac
+        } else {
+            fs::read_to_string(format!("/sys/class/net/{}/address", config.ap_interface))
+                .unwrap_or_else(|_| ap_mac.clone())
+                .trim()
+                .to_string()
+        };
         let _ = run("nmcli", &["dev", "set", &config.ap_interface, "managed", "no"]);
 
         let _ = fs::remove_file(HOSTAPD_PID);
@@ -991,12 +1033,14 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
             uplink: capability.uplink.clone(),
             net_source: net_source.clone(),
             ap_interface: config.ap_interface.clone(),
+            ap_mac: ap_mac.clone(),
             channel,
             band: band.label().to_string(),
             ssid: config.ssid.clone(),
             gateway: GATEWAY.to_string(),
             hostapd_pid,
             dnsmasq_pid,
+            watch_pid: None,
             ip_forward_before: forward_before.clone(),
             pinned_connection: pinned_connection.clone(),
             band_before: band_before.clone(),
@@ -1007,7 +1051,9 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
     })();
 
     match result {
-        Ok(state) => {
+        Ok(mut state) => {
+            fs::write(STATE_FILE, serde_json::to_string_pretty(&state)?)?;
+            state.watch_pid = spawn_watcher();
             fs::write(STATE_FILE, serde_json::to_string_pretty(&state)?)?;
             Ok(state)
         }
@@ -1069,6 +1115,11 @@ pub fn stop() -> Result<()> {
     };
     let state: RuntimeState = serde_json::from_str(&contents).context("invalid session state")?;
 
+    if let Some(pid) = state.watch_pid {
+        if process_alive(pid) {
+            let _ = run("kill", &[&pid.to_string()]);
+        }
+    }
     if process_alive(state.hostapd_pid) {
         let _ = run("kill", &[&state.hostapd_pid.to_string()]);
     }
@@ -1128,6 +1179,146 @@ pub fn stop() -> Result<()> {
     );
     let _ = fs::remove_file(STATE_FILE);
     Ok(())
+}
+
+fn current_channel(interface: &str) -> Option<(u32, u8)> {
+    let info = stdout("iw", &["dev", interface, "info"]).ok()?;
+    for line in info.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("channel ") {
+            let channel = rest.split_whitespace().next()?.parse::<u8>().ok()?;
+            let freq = rest
+                .split('(')
+                .nth(1)?
+                .split_whitespace()
+                .next()?
+                .parse::<u32>()
+                .ok()?;
+            return Some((freq, channel));
+        }
+    }
+    None
+}
+
+fn watch_log(line: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(WATCH_LOG) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn move_ap_channel(state: &mut RuntimeState, freq: u32, channel: u8) -> Result<()> {
+    // try a channel switch announcement first, so clients follow without a drop
+    let switched = Command::new("hostapd_cli")
+        .args([
+            "-i",
+            &state.ap_interface,
+            "chan_switch",
+            "5",
+            &freq.to_string(),
+        ])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    let mut applied = false;
+    if switched {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        applied = current_channel(&state.ap_interface)
+            .map(|(current_freq, _)| current_freq == freq)
+            .unwrap_or(false);
+    }
+    if !applied {
+        let config = fs::read_to_string(HOSTAPD_CONF).unwrap_or_default();
+        let updated = config
+            .lines()
+            .map(|line| {
+                if line.starts_with("channel=") {
+                    format!("channel={channel}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(HOSTAPD_CONF, updated)?;
+        if process_alive(state.hostapd_pid) {
+            let _ = run("kill", &[&state.hostapd_pid.to_string()]);
+        }
+        let _ = fs::remove_file(HOSTAPD_PID);
+        run(
+            "hostapd",
+            &["-B", "-P", HOSTAPD_PID, "-f", HOSTAPD_LOG, HOSTAPD_CONF],
+        )?;
+        state.hostapd_pid = wait_for_hostapd(&state.ap_interface)?;
+    }
+    state.channel = channel;
+    fs::write(STATE_FILE, serde_json::to_string_pretty(&state)?)?;
+    Ok(())
+}
+
+/// Long-running watcher for the single-radio channel constraint.
+pub fn watch() -> Result<()> {
+    let mut last: Option<(u32, u8)> = None;
+    let mut pending: Option<(u32, u8)> = None;
+    watch_log("watcher started");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let text = match fs::read_to_string(STATE_FILE) {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        let mut state: RuntimeState = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        let Some((freq, channel)) = current_channel(&state.uplink) else {
+            continue;
+        };
+        if band_for_frequency(freq) != Some(Band::B2_4) {
+            watch_log("station moved off 2.4 GHz; watcher stopping");
+            break;
+        }
+        if current_channel(&state.ap_interface).map(|(f, _)| f == freq) == Some(true) {
+            last = Some((freq, channel));
+            pending = None;
+            continue;
+        }
+        if last == Some((freq, channel)) {
+            continue;
+        }
+        if pending == Some((freq, channel)) {
+            match move_ap_channel(&mut state, freq, channel) {
+                Ok(()) => {
+                    watch_log(&format!("AP moved to channel {channel} ({freq} MHz)"));
+                    last = Some((freq, channel));
+                }
+                Err(error) => watch_log(&format!("channel move failed: {error}")),
+            }
+            pending = None;
+        } else {
+            pending = Some((freq, channel));
+        }
+    }
+    watch_log("watcher stopped");
+    Ok(())
+}
+
+fn spawn_watcher() -> Option<u32> {
+    use std::process::Stdio;
+    let exe = std::env::current_exe().ok()?;
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(WATCH_LOG)
+        .ok()?;
+    let child = Command::new(exe)
+        .arg("watch")
+        .stdout(Stdio::from(log.try_clone().ok()?))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .ok()?;
+    Some(child.id())
 }
 
 pub fn status() -> StatusInfo {
@@ -1223,6 +1414,18 @@ mod tests {
         assert!(rules[0].contains(&"-s") && rules[0].contains(&CLIENT_SUBNET));
         assert!(rules[1].contains(&"-d") && rules[1].contains(&"RELATED,ESTABLISHED"));
         assert!(rules.iter().all(|rule| rule[0] == "FORWARD" && rule.contains(&NAT_COMMENT)));
+    }
+
+    #[test]
+    fn derived_ap_mac() {
+        let station = "c0:b8:83:68:05:6a";
+        let ap = derive_mac(station).unwrap();
+        let first = u8::from_str_radix(&ap[..2], 16).unwrap();
+        assert_eq!(first & 0x01, 0);
+        assert_eq!(first & 0x02, 0x02);
+        assert_ne!(ap, station);
+        assert_eq!(derive_mac("02:00:00:00:01:01").unwrap(), "02:00:00:00:5b:01");
+        assert!(derive_mac("bad").is_none());
     }
 
     #[test]
