@@ -74,6 +74,8 @@ enum Command {
         hidden: bool,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        random_pass: bool,
     },
     /// List interfaces that can provide the internet uplink
     Sources,
@@ -289,8 +291,9 @@ fn main() -> Result<()> {
             channel,
             hidden,
             dry_run,
+            random_pass,
         } => {
-            let config = config_from(
+            let mut config = config_from(
                 ssid,
                 password,
                 ap_interface,
@@ -300,12 +303,18 @@ fn main() -> Result<()> {
                 channel,
                 hidden,
             );
+            if random_pass {
+                config.password = airfork::random_password(12)?;
+            }
             if dry_run {
                 out!("Dry run — no changes made");
                 out!("{}", plan(&config)?);
                 return Ok(());
             }
             let state = start(&config)?;
+            if random_pass {
+                out!("Password     {}", config.password);
+            }
             out!(
                 "Hotspot \"{}\" is running on {}",
                 state.ssid,
