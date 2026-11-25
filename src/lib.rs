@@ -210,6 +210,60 @@ fn max_channels(block: &str) -> Option<u32> {
         .ok()
 }
 
+// "Supported interface modes" in `iw phy X info`
+fn supported_modes(text: &str) -> Vec<String> {
+    let mut modes = Vec::new();
+    let mut in_section = false;
+    for line in text.lines() {
+        if line.contains("Supported interface modes:") {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let trimmed = line.trim();
+        if let Some(mode) = trimmed.strip_prefix('*') {
+            modes.push(mode.trim().to_string());
+        } else if !trimmed.is_empty() {
+            break;
+        }
+    }
+    modes
+}
+
+// per-frequency flags, e.g. "* 5220 MHz [44] (20.0 dBm) (no IR, radar detection)"
+fn freq_flags(text: &str, freq: Option<u32>) -> (bool, bool) {
+    let Some(freq) = freq else {
+        return (false, false);
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with(&format!("* {freq} MHz")) && !trimmed.starts_with(&format!("* {freq}.0 MHz")) {
+            continue;
+        }
+        return (
+            trimmed.contains("no IR") || trimmed.contains("passive scan"),
+            trimmed.contains("radar detection"),
+        );
+    }
+    (false, false)
+}
+
+fn regulatory_country() -> Option<String> {
+    let reg = stdout("iw", &["reg", "get"]).ok()?;
+    for line in reg.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("country ") {
+            let code = rest.split(':').next()?.split_whitespace().next()?;
+            if code != "00" && code != "99" {
+                return Some(code.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capability {
     pub phy: String,
@@ -220,6 +274,11 @@ pub struct Capability {
     pub band: Option<Band>,
     pub concurrent: bool,
     pub same_channel_required: bool,
+    pub ap_mode: bool,
+    pub no_ir: bool,
+    pub radar: bool,
+    pub second_adapter: Option<String>,
+    pub country: Option<String>,
     pub p2p_device: bool,
     pub combinations: Vec<String>,
     pub missing_tools: Vec<String>,
@@ -297,12 +356,27 @@ pub fn detect() -> Result<Capability> {
         .iter()
         .filter(|block| block.contains("managed") && block.contains("AP"))
         .all(|block| max_channels(block) == Some(1));
+    let ap_mode = supported_modes(&info).iter().any(|mode| mode == "AP");
+    let (no_ir, radar) = freq_flags(&info, station.freq);
 
-    let missing_tools = ["iw", "ip", "hostapd", "dnsmasq", "iptables"]
+    let second_adapter = devices
+        .iter()
+        .filter(|entry| entry.kind == "managed" && entry.phy != station.phy)
+        .find(|entry| {
+            stdout("iw", &["phy", &entry.phy, "info"])
+                .map(|text| supported_modes(&text).iter().any(|mode| mode == "AP"))
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.name.clone());
+
+    let mut missing_tools: Vec<String> = ["iw", "ip", "hostapd", "dnsmasq"]
         .iter()
         .filter(|tool| !tool_available(tool))
         .map(|tool| (*tool).to_string())
         .collect();
+    if !tool_available("nft") && !tool_available("iptables") {
+        missing_tools.push("nftables or iptables".into());
+    }
 
     let ssid = station
         .ssid
@@ -319,6 +393,11 @@ pub fn detect() -> Result<Capability> {
         band: station.freq.and_then(band_for_frequency),
         concurrent,
         same_channel_required,
+        ap_mode,
+        no_ir,
+        radar,
+        second_adapter,
+        country: regulatory_country(),
         p2p_device: devices.iter().any(|entry| entry.kind == "P2P-device"),
         combinations,
         missing_tools,
@@ -520,6 +599,99 @@ pub struct ClientInfo {
     pub ip: Option<String>,
     pub hostname: Option<String>,
     pub connected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorCheck {
+    pub level: String,
+    pub text: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorReport {
+    pub mode: String,
+    pub ready: bool,
+    pub verdict: String,
+    pub checks: Vec<DoctorCheck>,
+}
+
+impl DoctorReport {
+    fn add(&mut self, level: &str, text: impl Into<String>, detail: impl Into<String>) {
+        self.checks.push(DoctorCheck {
+            level: level.into(),
+            text: text.into(),
+            detail: detail.into(),
+        });
+    }
+}
+
+/// Read-only preflight report, modelled on what a user needs before starting.
+pub fn doctor() -> DoctorReport {
+    let mut report = DoctorReport {
+        mode: String::new(),
+        ready: false,
+        verdict: String::new(),
+        checks: Vec::new(),
+    };
+    let mut missing = Vec::new();
+    for tool in ["iw", "ip", "hostapd", "dnsmasq"] {
+        if tool_available(tool) {
+            report.add("ok", format!("{tool} installed"), "");
+        } else {
+            report.add("fail", format!("{tool} is missing"), "");
+            missing.push(tool);
+        }
+    }
+    if tool_available("nft") {
+        report.add("ok", "nftables installed", "used for private firewall tables");
+    } else if tool_available("iptables") {
+        report.add("warn", "nftables missing, using iptables", "tagged rules only");
+    } else {
+        report.add("fail", "no firewall tool", "install nftables or iptables");
+        missing.push("nftables or iptables");
+    }
+
+    match detect() {
+        Ok(cap) => {
+            report.add(
+                "info",
+                format!("adapter {} ({}, {})", cap.uplink, cap.phy, if cap.concurrent { "concurrent" } else { "single role" }),
+                cap.uplink_ssid.clone().unwrap_or_default(),
+            );
+            if cap.no_ir || cap.radar {
+                report.add(
+                    "warn",
+                    format!("channel {} is not usable for AP", cap.channel.unwrap_or(0)),
+                    if cap.radar { "DFS channel; use 2.4 GHz or 36-48/149-165" } else { "no IR; connect on 2.4 GHz or use a different country" },
+                );
+            }
+            if cap.country.is_none() {
+                report.add("warn", "no regulatory country set", "5 GHz AP may fail; set your country with iw reg set");
+            }
+            if cap.ap_mode && cap.concurrent {
+                report.mode = "concurrent".into();
+                report.add("ok", "client and hotspot at once", if cap.same_channel_required { "AP will follow the station channel" } else { "different channels allowed" });
+            } else if let Some(second) = &cap.second_adapter {
+                report.mode = "dedicated".into();
+                report.add("ok", format!("second adapter {second} can host the hotspot"), "keep the uplink on the other interface");
+            } else if sources().iter().any(|source| source != &cap.uplink) {
+                report.mode = "dedicated".into();
+                report.add("ok", "a non-Wi-Fi uplink can feed a Wi-Fi-only hotspot", "use --uplink with the Wi-Fi chip as AP");
+            } else {
+                report.verdict = "NOT READY: this chip cannot client and hotspot at once, and there is no second adapter or cable".into();
+                return report;
+            }
+            if !missing.is_empty() {
+                report.verdict = format!("ALMOST: {} mode once {} is installed", report.mode, missing.join(", "));
+            } else {
+                report.ready = true;
+                report.verdict = format!("READY: {} mode on {}", report.mode, cap.uplink);
+            }
+        }
+        Err(error) => report.verdict = format!("NOT READY: {error}"),
+    }
+    report
 }
 
 /// Interfaces that currently have an IPv4 default route, offered as internet sources.
@@ -1398,6 +1570,14 @@ mod tests {
     }
 
     #[test]
+    fn modes_and_freq_flags() {
+        let info = "Supported interface modes:\n\t\t * managed\n\t\t * AP\n\tband 2:\n\t\t* 5220 MHz [44] (20.0 dBm) (no IR)\n";
+        assert!(supported_modes(info).iter().any(|mode| mode == "AP"));
+        assert_eq!(freq_flags(info, Some(5220)), (true, false));
+        assert_eq!(freq_flags(info, Some(2437)), (false, false));
+    }
+
+    #[test]
     fn hostapd_conf_enables_80211n_and_wmm() {
         let capability = Capability {
             phy: "phy0".into(),
@@ -1408,6 +1588,11 @@ mod tests {
             band: Some(Band::B2_4),
             concurrent: true,
             same_channel_required: true,
+            ap_mode: true,
+            no_ir: false,
+            radar: false,
+            second_adapter: None,
+            country: Some("KE".into()),
             p2p_device: false,
             combinations: vec![],
             missing_tools: vec![],

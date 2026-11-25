@@ -25,6 +25,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Check whether this machine can host a hotspot while online
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
     /// Report the adapter's concurrent interface capability
     Detect {
         #[arg(long)]
@@ -125,6 +130,27 @@ fn print_capability(capability: &Capability) {
         }
     );
     out!(
+        "AP mode      {}",
+        if capability.ap_mode { "yes" } else { "no" }
+    );
+    out!(
+        "Channel IR   {}",
+        if capability.no_ir {
+            "no (passive scan)"
+        } else if capability.radar {
+            "DFS"
+        } else {
+            "yes"
+        }
+    );
+    out!(
+        "Country      {}",
+        capability.country.as_deref().unwrap_or("not set")
+    );
+    if let Some(second) = &capability.second_adapter {
+        out!("Second AP    {second}");
+    }
+    out!(
         "P2P device   {}",
         if capability.p2p_device { "yes" } else { "no" }
     );
@@ -174,6 +200,26 @@ fn print_status(info: &StatusInfo) {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Doctor { json } => {
+            let report = airfork::doctor();
+            if json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let mark = |level: &str| match level {
+                    "ok" => "+",
+                    "warn" => "!",
+                    "fail" => "x",
+                    _ => "-",
+                };
+                for check in &report.checks {
+                    out!("{} {}", mark(&check.level), check.text);
+                    if !check.detail.is_empty() {
+                        out!("    {}", check.detail);
+                    }
+                }
+                out!("{}", report.verdict);
+            }
+        }
         Command::Detect { json } => {
             let capability = detect()?;
             if json {
