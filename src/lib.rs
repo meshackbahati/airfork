@@ -29,6 +29,12 @@ pub const GATEWAY: &str = "192.168.42.1";
 pub const DHCP_RANGE: &str = "192.168.42.10,192.168.42.100,255.255.255.0,24h";
 pub const NAT_COMMENT: &str = "airfork";
 
+// survives a reboot, unlike /run. holds what start() changed in the saved
+// NetworkManager profile, so a crash or power cut cannot leave the user's
+// Wi-Fi locked to 2.4 GHz with nothing left to undo it.
+pub const RESTORE_DIR: &str = "/var/lib/airfork";
+pub const RESTORE_FILE: &str = "/var/lib/airfork/restore.json";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Band {
     B2_4,
@@ -345,8 +351,8 @@ impl HotspotConfig {
         if self.ssid.is_empty() || self.ssid.len() > 32 {
             bail!("SSID must be between 1 and 32 bytes");
         }
-        if self.password.len() < 8 {
-            bail!("password must be at least 8 characters for WPA2");
+        if self.password.len() < 8 || self.password.len() > 63 {
+            bail!("password must be 8 to 63 characters for WPA2");
         }
         if self.ssid.contains('\n') || self.password.contains('\n') {
             bail!("SSID and password must not contain newlines");
@@ -401,7 +407,7 @@ fn render_hostapd_conf(capability: &Capability, config: &HotspotConfig) -> Resul
     let channel = capability.channel.unwrap_or(1);
     let band = capability.band.unwrap_or(Band::B2_4);
     Ok(format!(
-        "interface={}\ndriver=nl80211\nssid={}\nhw_mode={}\nchannel={}\ncountry_code={}\nwpa=2\nwpa_passphrase={}\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\n",
+        "interface={}\ndriver=nl80211\nssid={}\nhw_mode={}\nchannel={}\nieee80211n=1\nwmm_enabled=1\ncountry_code={}\nwpa=2\nwpa_passphrase={}\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\n",
         config.ap_interface,
         config.ssid,
         band.hostapd_mode(),
@@ -633,11 +639,13 @@ fn ensure_ap_band(capability: &Capability) -> Result<(Capability, Option<(String
     let previous = if previous.is_empty() { None } else { Some(previous) };
 
     run("nmcli", &["con", "mod", &name, "802-11-wireless.band", "bg"])?;
+    save_band_restore(&name, &previous)?;
     let _ = run("nmcli", &["con", "up", &name]);
     wait_for_uplink(&capability.uplink);
     let updated = detect()?;
     if updated.band != Some(Band::B2_4) {
         let _ = restore_band(&name, &previous);
+        clear_band_restore();
         let _ = run("nmcli", &["con", "up", &name]);
         bail!("the uplink did not move to 2.4 GHz; hotspot not started");
     }
@@ -655,6 +663,85 @@ fn restore_band(name: &str, previous: &Option<String>) -> Result<()> {
             previous.as_deref().unwrap_or(""),
         ],
     )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BandRestore {
+    connection: String,
+    band_before: Option<String>,
+}
+
+fn save_band_restore(connection: &str, band_before: &Option<String>) -> Result<()> {
+    fs::create_dir_all(RESTORE_DIR)?;
+    let record = BandRestore {
+        connection: connection.to_string(),
+        band_before: band_before.clone(),
+    };
+    fs::write(RESTORE_FILE, serde_json::to_string_pretty(&record)?)?;
+    Ok(())
+}
+
+fn clear_band_restore() {
+    let _ = fs::remove_file(RESTORE_FILE);
+}
+
+// a session that never reached stop() (crash, reboot, power cut) leaves the
+// band limit in the saved profile and the NM drop-in in /etc. /run is gone by
+// then, so the restore record in /var/lib is the only way back.
+fn recover_leftovers() {
+    if Path::new(STATE_FILE).exists() {
+        return;
+    }
+    if let Ok(text) = fs::read_to_string(RESTORE_FILE) {
+        if let Ok(record) = serde_json::from_str::<BandRestore>(&text) {
+            let _ = restore_band(&record.connection, &record.band_before);
+        }
+        clear_band_restore();
+    }
+    if Path::new(NM_CONF).exists() {
+        unhide_from_networkmanager();
+    }
+}
+
+// MASQUERADE alone is not enough when something (Docker, ufw, firewalld) has
+// set the FORWARD policy to DROP: clients join but get no internet.
+fn forward_rules() -> [Vec<&'static str>; 2] {
+    [
+        vec![
+            "FORWARD", "-s", CLIENT_SUBNET, "-j", "ACCEPT", "-m", "comment", "--comment", NAT_COMMENT,
+        ],
+        vec![
+            "FORWARD", "-d", CLIENT_SUBNET, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED",
+            "-j", "ACCEPT", "-m", "comment", "--comment", NAT_COMMENT,
+        ],
+    ]
+}
+
+fn allow_forwarding() -> Result<()> {
+    for rule in forward_rules() {
+        let mut check = vec!["-C"];
+        check.extend(rule.iter().copied());
+        let present = Command::new("iptables")
+            .args(&check)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !present {
+            // insert at the top so it sits ahead of a DROP policy's chains
+            let mut insert = vec!["-I", rule[0], "1"];
+            insert.extend(rule[1..].iter().copied());
+            run("iptables", &insert)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_forwarding() {
+    for rule in forward_rules() {
+        let mut delete = vec!["-D"];
+        delete.extend(rule.iter().copied());
+        let _ = run("iptables", &delete);
+    }
 }
 
 // the router periodically sends 802.11v "disassociation imminent" requests.
@@ -730,7 +817,7 @@ pub fn plan(config: &HotspotConfig) -> Result<String> {
         String::new()
     };
     let ap_band = if band != Band::B2_4 { Band::B2_4 } else { band };
-    let ap_channel = if ap_band != band { 1 } else { channel };
+    let ap_channel = if ap_band != band { "picked after the move".to_string() } else { channel.to_string() };
     Ok(format!(
         "{switch_note}Uplink       {} on {} channel {} ({} MHz, {})\n\
          Virtual AP  {} with MAC {}\n\
@@ -762,6 +849,7 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
     if !is_root() {
         bail!("start needs root; use sudo or pkexec");
     }
+    recover_leftovers();
 
     let capability = detect()?;
     if !capability.concurrent {
@@ -895,6 +983,7 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
             run("iptables", &add_args)?;
         }
 
+        allow_forwarding()?;
         route_clients(&source_gateway, &net_source)?;
         fs::write("/proc/sys/net/ipv4/ip_forward", "1\n")?;
 
@@ -946,6 +1035,7 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
                     NAT_COMMENT,
                 ],
             );
+            remove_forwarding();
             unroute_clients(&source_gateway, &net_source);
             let _ = fs::write(
                 "/proc/sys/net/ipv4/ip_forward",
@@ -956,6 +1046,7 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
             if let Some(name) = &pinned_connection {
                 let _ = restore_band(name, &band_before);
             }
+            clear_band_restore();
             set_btm(
                 &capability.uplink,
                 btm_before.as_deref().unwrap_or("0"),
@@ -1019,6 +1110,7 @@ pub fn stop() -> Result<()> {
             NAT_COMMENT,
         ],
     );
+    remove_forwarding();
     unroute_clients(&state.uplink_gateway, &state.net_source);
     let _ = fs::write(
         "/proc/sys/net/ipv4/ip_forward",
@@ -1029,6 +1121,7 @@ pub fn stop() -> Result<()> {
     if let Some(name) = &state.pinned_connection {
         let _ = restore_band(name, &state.band_before);
     }
+    clear_band_restore();
     set_btm(
         &state.uplink,
         state.btm_before.as_deref().unwrap_or("0"),
@@ -1104,6 +1197,35 @@ mod tests {
     }
 
     #[test]
+    fn hostapd_conf_enables_80211n_and_wmm() {
+        let capability = Capability {
+            phy: "phy0".into(),
+            uplink: "wlan0".into(),
+            uplink_ssid: None,
+            frequency_mhz: Some(2437),
+            channel: Some(6),
+            band: Some(Band::B2_4),
+            concurrent: true,
+            same_channel_required: true,
+            p2p_device: false,
+            combinations: vec![],
+            missing_tools: vec![],
+        };
+        let conf = render_hostapd_conf(&capability, &HotspotConfig::default()).unwrap();
+        assert!(conf.contains("channel=6\n"));
+        assert!(conf.contains("ieee80211n=1\n"));
+        assert!(conf.contains("wmm_enabled=1\n"));
+    }
+
+    #[test]
+    fn forward_rules_cover_both_directions() {
+        let rules = forward_rules();
+        assert!(rules[0].contains(&"-s") && rules[0].contains(&CLIENT_SUBNET));
+        assert!(rules[1].contains(&"-d") && rules[1].contains(&"RELATED,ESTABLISHED"));
+        assert!(rules.iter().all(|rule| rule[0] == "FORWARD" && rule.contains(&NAT_COMMENT)));
+    }
+
+    #[test]
     fn config_checks() {
         let mut config = HotspotConfig::default();
         assert!(config.validate().is_ok());
@@ -1111,6 +1233,8 @@ mod tests {
         assert!(config.validate().is_err());
         config.ssid = "lab".into();
         config.password = "short".into();
+        assert!(config.validate().is_err());
+        config.password = "x".repeat(64);
         assert!(config.validate().is_err());
         config.password = "longenough".into();
         config.ap_interface = "bad-name".into();
