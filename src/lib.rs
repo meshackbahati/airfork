@@ -404,6 +404,19 @@ pub fn detect() -> Result<Capability> {
     })
 }
 
+/// A readable random WPA2 passphrase, avoiding look-alike characters.
+pub fn random_password(length: usize) -> Result<String> {
+    use std::io::Read;
+    const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+    let length = length.clamp(8, 63);
+    let mut bytes = vec![0u8; length];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes
+        .iter()
+        .map(|byte| ALPHABET[*byte as usize % ALPHABET.len()] as char)
+        .collect())
+}
+
 #[derive(Debug, Clone)]
 pub struct HotspotConfig {
     pub ssid: String,
@@ -411,6 +424,10 @@ pub struct HotspotConfig {
     pub ap_interface: String,
     pub country: String,
     pub uplink: Option<String>,
+    pub ap_base: Option<String>,
+    pub channel: Option<u8>,
+    pub hidden: bool,
+    pub dry_run: bool,
 }
 
 impl Default for HotspotConfig {
@@ -421,6 +438,10 @@ impl Default for HotspotConfig {
             ap_interface: "wlan0_ap".into(),
             country: "KE".into(),
             uplink: None,
+            ap_base: None,
+            channel: None,
+            hidden: false,
+            dry_run: false,
         }
     }
 }
@@ -462,6 +483,8 @@ pub struct RuntimeState {
     pub uplink: String,
     pub net_source: String,
     pub ap_interface: String,
+    pub ap_base: String,
+    pub mode: String,
     pub ap_mac: String,
     pub channel: u8,
     pub band: String,
@@ -485,18 +508,21 @@ pub struct StatusInfo {
     pub capability: Option<Capability>,
 }
 
-fn render_hostapd_conf(capability: &Capability, config: &HotspotConfig) -> Result<String> {
-    let channel = capability.channel.unwrap_or(1);
-    let band = capability.band.unwrap_or(Band::B2_4);
-    Ok(format!(
-        "interface={}\ndriver=nl80211\nssid={}\nhw_mode={}\nchannel={}\nieee80211n=1\nwmm_enabled=1\ncountry_code={}\nwpa=2\nwpa_passphrase={}\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\n",
+fn render_hostapd_conf(channel: u8, band: Band, config: &HotspotConfig) -> String {
+    let hidden = if config.hidden {
+        "ignore_broadcast_ssid=1\n"
+    } else {
+        ""
+    };
+    format!(
+        "interface={}\ndriver=nl80211\nssid={}\nhw_mode={}\nchannel={}\nieee80211n=1\nwmm_enabled=1\ncountry_code={}\n{hidden}wpa=2\nwpa_passphrase={}\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\n",
         config.ap_interface,
         config.ssid,
         band.hostapd_mode(),
         channel,
         config.country,
         config.password
-    ))
+    )
 }
 
 fn render_dnsmasq_conf(config: &HotspotConfig) -> String {
@@ -1012,43 +1038,59 @@ fn wait_for_hostapd(ap: &str) -> Result<u32> {
 pub fn plan(config: &HotspotConfig) -> Result<String> {
     config.validate()?;
     let capability = detect()?;
-    if !capability.concurrent {
+    let ap_base = config
+        .ap_base
+        .clone()
+        .unwrap_or_else(|| capability.uplink.clone());
+    let concurrent = capability.concurrent && ap_base == capability.uplink;
+    if !concurrent && !capability.ap_mode && capability.second_adapter.is_none() {
         bail!(
-            "this adapter cannot run station and AP interfaces together; the combinations are:\n{}",
+            "no adapter here can host an AP; combinations:\n{}",
             capability.combinations.join("\n")
         );
     }
-    let channel = capability.channel.unwrap_or(1);
-    let band = capability.band.unwrap_or(Band::B2_4);
-    let switch_note = if band != Band::B2_4 {
-        "Switch    uplink will be limited to 2.4 GHz for the AP\n".to_string()
+    let (channel, band, ap_channel, switch_note) = if concurrent {
+        let channel = capability.channel.unwrap_or(1);
+        let band = capability.band.unwrap_or(Band::B2_4);
+        let note = if band != Band::B2_4 {
+            "Switch    uplink will be limited to 2.4 GHz for the AP\n".to_string()
+        } else {
+            String::new()
+        };
+        let ap_channel = if band != Band::B2_4 {
+            "picked after the move".to_string()
+        } else {
+            channel.to_string()
+        };
+        (channel, Band::B2_4, ap_channel, note)
     } else {
-        String::new()
+        let channel = config.channel.unwrap_or(6);
+        (channel, Band::B2_4, channel.to_string(), "Mode        dedicated AP\n".to_string())
     };
-    let ap_band = if band != Band::B2_4 { Band::B2_4 } else { band };
-    let ap_channel = if ap_band != band { "picked after the move".to_string() } else { channel.to_string() };
+    let source = config.uplink.as_deref().unwrap_or(&capability.uplink);
     Ok(format!(
         "{switch_note}Uplink       {} on {} channel {} ({} MHz, {})\n\
-         Virtual AP  {} with MAC {}\n\
-         Hotspot     \"{}\" on {} channel {} (WPA2)\n\
+         Virtual AP  {} on {} with MAC {}\n\
+         Hotspot     \"{}\" on {} channel {} (WPA2{})\n\
          Network     192.168.42.0/24, DHCP 192.168.42.10 through 100\n\
          Source      internet via {}\n\
-         Sharing     NAT from {} to {} via iptables and policy routing\n\
-         Cleanup     airfork stop removes interface, daemons, NAT rule and state\n\
-         Note        one radio, so the two roles share throughput\n",
+         Sharing     NAT from {} to {} via policy routing\n\
+         Cleanup     airfork stop removes interface, daemons, NAT rule and state\n",
         capability.uplink,
         capability.uplink_ssid.as_deref().unwrap_or("<hidden>"),
         channel,
         capability.frequency_mhz.unwrap_or(0),
         band.label(),
         config.ap_interface,
-        ap_mac_for(&capability.uplink).unwrap_or_else(|| AP_MAC.to_string()),
+        ap_base,
+        ap_mac_for(&ap_base).unwrap_or_else(|| AP_MAC.to_string()),
         config.ssid,
-        ap_band.label(),
+        band.label(),
         ap_channel,
-        config.uplink.as_deref().unwrap_or(&capability.uplink),
+        if config.hidden { ", hidden" } else { "" },
+        source,
         config.ap_interface,
-        config.uplink.as_deref().unwrap_or(&capability.uplink)
+        source
     ))
 }
 
@@ -1061,12 +1103,6 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
     recover_leftovers();
 
     let capability = detect()?;
-    if !capability.concurrent {
-        bail!(
-            "this adapter cannot run station and AP interfaces together; the combinations are:\n{}",
-            capability.combinations.join("\n")
-        );
-    }
     if !capability.missing_tools.is_empty() {
         bail!(
             "missing required tools: {}",
@@ -1077,21 +1113,6 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
         stop().context("could not clear the previous session")?;
     }
 
-    // ignore the router's band-steering before the station changes channel
-    let btm_before = read_btm(&capability.uplink);
-    set_btm(&capability.uplink, "1");
-
-    let (capability, pin) = match ensure_ap_band(&capability) {
-        Ok(value) => value,
-        Err(error) => {
-            set_btm(&capability.uplink, btm_before.as_deref().unwrap_or("0"));
-            return Err(error);
-        }
-    };
-    let (pinned_connection, band_before) = match pin {
-        Some((name, old)) => (Some(name), old),
-        None => (None, None),
-    };
     let net_source = config.uplink.clone().unwrap_or_else(|| {
         if uplink_gateway(&capability.uplink).is_ok() {
             capability.uplink.clone()
@@ -1099,17 +1120,61 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
             sources().into_iter().next().unwrap_or_else(|| capability.uplink.clone())
         }
     });
+    let ap_base = config
+        .ap_base
+        .clone()
+        .unwrap_or_else(|| capability.uplink.clone());
+    let concurrent = capability.concurrent && ap_base == capability.uplink;
+    if !concurrent && !capability.ap_mode && capability.second_adapter.is_none() {
+        bail!(
+            "no adapter here can host an AP; combinations:\n{}",
+            capability.combinations.join("\n")
+        );
+    }
     let source_gateway = uplink_gateway(&net_source)
         .with_context(|| format!("{net_source} has no default route; pick another internet source"))?;
-    let notice = pinned_connection
-        .as_ref()
-        .map(|_| "uplink limited to 2.4 GHz for the AP".to_string());
 
-    let channel = capability.channel.unwrap_or(1);
-    let band = capability.band.unwrap_or(Band::B2_4);
+    let (mut capability, pin, btm_before) = if concurrent {
+        // ignore band steering before the station changes channel
+        let before = read_btm(&capability.uplink);
+        set_btm(&capability.uplink, "1");
+        match ensure_ap_band(&capability) {
+            Ok((updated, pin)) => (updated, pin, before),
+            Err(error) => {
+                set_btm(&capability.uplink, before.as_deref().unwrap_or("0"));
+                return Err(error);
+            }
+        }
+    } else {
+        (capability.clone(), None, None)
+    };
+    let (pinned_connection, band_before) = match pin {
+        Some((name, old)) => (Some(name), old),
+        None => (None, None),
+    };
+    let notice = if concurrent {
+        pinned_connection
+            .as_ref()
+            .map(|_| "uplink limited to 2.4 GHz for the AP".to_string())
+    } else {
+        Some("dedicated AP mode".to_string())
+    };
+
+    let channel = if concurrent {
+        capability.channel.unwrap_or(1)
+    } else {
+        config.channel.unwrap_or(6)
+    };
+    let band = if concurrent {
+        capability.band.unwrap_or(Band::B2_4)
+    } else {
+        Band::B2_4
+    };
+    capability.channel = Some(channel);
+    capability.band = Some(band);
 
     fs::create_dir_all(RUN_DIR)?;
-    fs::write(HOSTAPD_CONF, render_hostapd_conf(&capability, config)?)?;
+    fs::write(HOSTAPD_CONF, render_hostapd_conf(channel, band, config))?;
     fs::write(DNSMASQ_CONF, render_dnsmasq_conf(config))?;
 
     let forward_before = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
@@ -1117,7 +1182,7 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
         .trim()
         .to_string();
 
-    let ap_mac = ap_mac_for(&capability.uplink).unwrap_or_else(|| AP_MAC.to_string());
+    let ap_mac = ap_mac_for(&ap_base).unwrap_or_else(|| AP_MAC.to_string());
 
     // NM must be out of the way before the interface exists
     hide_from_networkmanager(&config.ap_interface, &ap_mac)?;
@@ -1128,7 +1193,7 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
         "iw",
         &[
             "dev",
-            &capability.uplink,
+            &ap_base,
             "interface",
             "add",
             &config.ap_interface,
@@ -1212,6 +1277,8 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
             uplink: capability.uplink.clone(),
             net_source: net_source.clone(),
             ap_interface: config.ap_interface.clone(),
+            ap_base: ap_base.clone(),
+            mode: if concurrent { "concurrent".into() } else { "dedicated".into() },
             ap_mac: ap_mac.clone(),
             channel,
             band: band.label().to_string(),
@@ -1232,7 +1299,7 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
     match result {
         Ok(mut state) => {
             fs::write(STATE_FILE, serde_json::to_string_pretty(&state)?)?;
-            state.watch_pid = spawn_watcher();
+            state.watch_pid = if concurrent { spawn_watcher() } else { None };
             fs::write(STATE_FILE, serde_json::to_string_pretty(&state)?)?;
             Ok(state)
         }
@@ -1579,25 +1646,7 @@ mod tests {
 
     #[test]
     fn hostapd_conf_enables_80211n_and_wmm() {
-        let capability = Capability {
-            phy: "phy0".into(),
-            uplink: "wlan0".into(),
-            uplink_ssid: None,
-            frequency_mhz: Some(2437),
-            channel: Some(6),
-            band: Some(Band::B2_4),
-            concurrent: true,
-            same_channel_required: true,
-            ap_mode: true,
-            no_ir: false,
-            radar: false,
-            second_adapter: None,
-            country: Some("KE".into()),
-            p2p_device: false,
-            combinations: vec![],
-            missing_tools: vec![],
-        };
-        let conf = render_hostapd_conf(&capability, &HotspotConfig::default()).unwrap();
+        let conf = render_hostapd_conf(6, Band::B2_4, &HotspotConfig::default());
         assert!(conf.contains("channel=6\n"));
         assert!(conf.contains("ieee80211n=1\n"));
         assert!(conf.contains("wmm_enabled=1\n"));

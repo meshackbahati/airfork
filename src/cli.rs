@@ -47,6 +47,12 @@ enum Command {
         country: Option<String>,
         #[arg(long, value_name = "IFACE")]
         uplink: Option<String>,
+        #[arg(long, value_name = "IFACE")]
+        ap_base: Option<String>,
+        #[arg(long)]
+        channel: Option<u8>,
+        #[arg(long)]
+        hidden: bool,
     },
     /// Start the virtual access point; requires root
     Start {
@@ -60,6 +66,14 @@ enum Command {
         country: Option<String>,
         #[arg(long, value_name = "IFACE")]
         uplink: Option<String>,
+        #[arg(long, value_name = "IFACE")]
+        ap_base: Option<String>,
+        #[arg(long)]
+        channel: Option<u8>,
+        #[arg(long)]
+        hidden: bool,
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List interfaces that can provide the internet uplink
     Sources,
@@ -80,6 +94,9 @@ fn config_from(
     ap_interface: Option<String>,
     country: Option<String>,
     uplink: Option<String>,
+    ap_base: Option<String>,
+    channel: Option<u8>,
+    hidden: bool,
 ) -> HotspotConfig {
     let mut config = HotspotConfig::default();
     if let Some(value) = ssid {
@@ -97,6 +114,13 @@ fn config_from(
     if let Some(value) = uplink {
         config.uplink = Some(value);
     }
+    if let Some(value) = ap_base {
+        config.ap_base = Some(value);
+    }
+    if let Some(value) = channel {
+        config.channel = Some(value);
+    }
+    config.hidden = hidden;
     config
 }
 
@@ -234,8 +258,13 @@ fn main() -> Result<()> {
             ap_interface,
             country,
             uplink,
+            ap_base,
+            channel,
+            hidden,
         } => {
-            let config = config_from(ssid, password, ap_interface, country, uplink);
+            let config = config_from(
+                ssid, password, ap_interface, country, uplink, ap_base, channel, hidden,
+            );
             out!("{}", plan(&config)?);
         }
         Command::Start {
@@ -244,8 +273,19 @@ fn main() -> Result<()> {
             ap_interface,
             country,
             uplink,
+            ap_base,
+            channel,
+            hidden,
+            dry_run,
         } => {
-            let config = config_from(ssid, password, ap_interface, country, uplink);
+            let config = config_from(
+                ssid, password, ap_interface, country, uplink, ap_base, channel, hidden,
+            );
+            if dry_run {
+                out!("Dry run — no changes made");
+                out!("{}", plan(&config)?);
+                return Ok(());
+            }
             let state = start(&config)?;
             out!("Hotspot \"{}\" is running on {}", state.ssid, state.ap_interface);
             if let Some(notice) = &state.notice {

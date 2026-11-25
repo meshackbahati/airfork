@@ -434,6 +434,10 @@ fn build_ui(app: &adw::Application) {
             ap_interface: iface_value.clone(),
             country: "KE".into(),
             uplink: selected_string(&ui.source),
+            ap_base: None,
+            channel: None,
+            hidden: false,
+            dry_run: false,
         };
         if let Err(error) = config.validate() {
             log(&ui.log, &format!("bad config: {error}"));
