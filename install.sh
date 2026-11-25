@@ -39,4 +39,7 @@ sudo tee /usr/share/polkit-1/actions/dev.airfork.policy >/dev/null <<EOF
 </policyconfig>
 EOF
 
+sudo install -Dm755 scripts/99-airfork-wifi /etc/NetworkManager/dispatcher.d/99-airfork-wifi
+/usr/bin/wpa_cli -i wlan0 set disable_btm 1 >/dev/null 2>&1 || true
+
 echo "installed: $PREFIX/bin/airfork and ~/.local/bin/airfork-gui"

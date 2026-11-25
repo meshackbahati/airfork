@@ -25,6 +25,11 @@ on 5 GHz here, so a session started from 5 GHz moves the station to 2.4 GHz and
 waits for DHCP, roughly 40 seconds. Later starts are immediate. Throughput is
 shared. This is a lab tool for your own connection, not a jammer.
 
+A NetworkManager dispatcher hook keeps 802.11v BTM disabled on `wlan0` so the
+router cannot steer the station between its radios. Drops that the router
+initiates itself (deauthentication reason 2) cannot be prevented from the
+client; the router must be configured to stop them.
+
 ## Build
 
 Requires `iw`, `ip`, `hostapd`, `dnsmasq`, `iptables`, NetworkManager and GTK4
