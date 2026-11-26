@@ -3,6 +3,14 @@
 # this is installed by install.sh as a NetworkManager dispatcher hook
 [ "$1" = "wlan0" ] || exit 0
 case "$2" in
-    up|dhcp4-change|reapply) /usr/bin/wpa_cli -i wlan0 set disable_btm 1 >/dev/null 2>&1 ;;
+    pre-up|up|dhcp4-change|reapply)
+        # must be set before association, otherwise the client still accepts
+        # the router's 802.11v transition request
+        /usr/bin/wpa_cli -i wlan0 set disable_btm 1 >/dev/null 2>&1
+        # undo a band limit left by a session that never reached stop
+        if [ ! -f /run/airfork/state.json ] && [ -x /usr/local/bin/airfork ]; then
+            /usr/local/bin/airfork recover >/dev/null 2>&1
+        fi
+        ;;
 esac
 exit 0

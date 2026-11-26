@@ -83,6 +83,8 @@ enum Command {
     Stop,
     #[command(hide = true)]
     Watch,
+    #[command(hide = true)]
+    Recover,
     /// Report the active session and the adapter state
     Status {
         #[arg(long)]
@@ -331,6 +333,9 @@ fn main() -> Result<()> {
         }
         Command::Watch => {
             airfork::watch()?;
+        }
+        Command::Recover => {
+            airfork::recover_leftovers();
         }
         Command::Sources => {
             for source in airfork::sources() {

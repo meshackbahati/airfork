@@ -840,6 +840,20 @@ pub fn clients() -> Vec<ClientInfo> {
     found.into_values().collect()
 }
 
+// hostapd.conf holds the WPA passphrase, so it must not be world-readable
+fn write_private(path: &str, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
 fn read_pid(path: &str) -> Result<u32> {
     let contents = fs::read_to_string(path).with_context(|| format!("could not read {path}"))?;
     contents
@@ -964,7 +978,8 @@ fn clear_band_restore() {
 // a session that never reached stop() (crash, reboot, power cut) leaves the
 // band limit in the saved profile and the NM drop-in in /etc. /run is gone by
 // then, so the restore record in /var/lib is the only way back.
-fn recover_leftovers() {
+/// Restore a Wi-Fi profile left changed by a session that never reached stop.
+pub fn recover_leftovers() {
     if Path::new(STATE_FILE).exists() {
         return;
     }
@@ -1352,8 +1367,8 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
     capability.band = Some(band);
 
     fs::create_dir_all(RUN_DIR)?;
-    fs::write(HOSTAPD_CONF, render_hostapd_conf(channel, band, config))?;
-    fs::write(DNSMASQ_CONF, render_dnsmasq_conf(config))?;
+    write_private(HOSTAPD_CONF, &render_hostapd_conf(channel, band, config))?;
+    write_private(DNSMASQ_CONF, &render_dnsmasq_conf(config))?;
 
     let forward_before = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
         .unwrap_or_else(|_| "0\n".to_string())
